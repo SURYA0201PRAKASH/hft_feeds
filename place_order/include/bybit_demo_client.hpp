@@ -21,7 +21,13 @@ public:
     double qty,
     double price,
     const std::string& tif = "GTC"
-);
+	);
+	// Cancel an order by orderId
+    std::string cancel_order(
+        const std::string& category,
+        const std::string& symbol,
+        const std::string& orderId
+    );
 private:
     std::string api_key_;
     std::string api_secret_;

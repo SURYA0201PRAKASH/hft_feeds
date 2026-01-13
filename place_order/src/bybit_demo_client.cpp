@@ -123,3 +123,16 @@ std::string BybitDemoClient::post(const std::string& path, const std::string& bo
     }
     return resp;
 }
+
+std::string BybitDemoClient::cancel_order(
+    const std::string& category,
+    const std::string& symbol,
+    const std::string& orderId
+) {
+    nlohmann::json j;
+    j["category"] = category;
+    j["symbol"]   = symbol;
+    j["orderId"]  = orderId;
+
+    return post("/v5/order/cancel", j.dump());
+}
