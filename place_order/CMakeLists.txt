@@ -11,6 +11,7 @@ find_package(nlohmann_json REQUIRED)
 add_executable(place_order
     src/main.cpp
     src/bybit_demo_client.cpp
+	src/imb_momo_strategy.cpp
 )
 
 # cppzmq header (zmq.hpp)

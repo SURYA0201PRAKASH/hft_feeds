@@ -23,12 +23,18 @@
 #include <nlohmann/json.hpp>
 
 #include "bybit_demo_client.hpp"
+#include "imb_momo_strategy.hpp"
+// ---- Logging (avoid interleaved prints from multiple threads) ----
+static std::mutex g_log_mtx;
 
 static const char* LEDGER_PATH       = "executions_ledger.jsonl";
 static const char* FUND_LEDGER_PATH  = "funding_ledger.jsonl";
 static const char* TRADE_LEDGER_PATH = "trades_ledger.jsonl";
 
 static std::mutex g_ledger_mtx;
+static std::atomic<bool> g_auto{false};
+static std::mutex g_exec_mtx;   // protect bybit API calls inside rx thread
+static std::atomic<bool> g_print_sig{true};
 
 static double get_num_safe(const nlohmann::json& v);
 
@@ -689,7 +695,9 @@ int main() {
         env_or("BYBIT_API_KEY", ""),
         env_or("BYBIT_API_SECRET", "")
     );
-
+	ImbMomoParams sp;
+	ImbMomoStrategy strat(sp);
+	
     // Ledger warmup
     load_seen_exec_ids();
     load_seen_funding_ids();
@@ -725,7 +733,12 @@ int main() {
             } else {
                 payload = std::string(static_cast<char*>(part1.data()), part1.size());
             }
-
+			// ✅ ADD HERE
+			static int raw_prints = 0;
+			if (raw_prints < 5) {
+				std::cout << "\n[ZMQ RAW " << raw_prints << "] " << payload << "\n";
+				raw_prints++;
+			}
             try {
                 auto j = nlohmann::json::parse(payload);
 
@@ -746,6 +759,81 @@ int main() {
                     g_last_bid = bid;
                     g_last_ask = ask;
                 }
+				MarketTick t;
+				t.exchange = j.value("exchange", "");
+				t.instrument = j.value("instrument", "");
+				t.ts_ms = j.value("ts_ms", 0LL);
+
+				auto &tob2 = j.at("top_of_book");
+				t.bid = get_num_safe(tob2.at("bid"));
+				t.ask = get_num_safe(tob2.at("ask"));
+				t.mid = get_num_safe(tob2.at("mid"));
+				t.spread = get_num_safe(tob2.at("spread"));
+
+				auto &ret = j.at("returns");
+				t.r1 = get_num_safe(ret.at("r1"));
+				t.r5 = get_num_safe(ret.at("r5"));
+				t.r10 = get_num_safe(ret.at("r10"));
+
+				auto &dep = j.at("depth");
+				if (dep.contains("bid_vol") && dep["bid_vol"].is_array())
+    				for (auto &x : dep["bid_vol"]) t.bid_vol.push_back(get_num_safe(x));
+				if (dep.contains("ask_vol") && dep["ask_vol"].is_array())
+    				for (auto &x : dep["ask_vol"]) t.ask_vol.push_back(get_num_safe(x));
+
+				auto sig = strat.on_tick(t);
+				if (sig.has_value() && g_print_sig.load() && !g_auto.load()) {
+					std::lock_guard<std::mutex> lk(g_log_mtx);
+    				std::string s = (sig->side == Side::Buy) ? "BUY" : "SELL";
+    				std::cout << "[STRAT] "
+              				<< (sig->type == StrategySignal::Type::Enter ? "ENTER " : "EXIT ")
+              				<< s
+              				<< " mid=" << t.mid
+              				<< " spr=" << t.spread
+              				<< " r1=" << t.r1
+              				<< " r5=" << t.r5
+              				<< " imb=" << sig->imbalance
+              				<< " tp=" << sig->tp_px
+              				<< " sl=" << sig->sl_px
+              				<< " reason=" << sig->reason
+              				<< "\n";
+				}
+				if (sig.has_value() && g_auto.load() && bybit.ready()) {
+    std::lock_guard<std::mutex> api_lk(g_exec_mtx);
+
+    std::string category = env_or("STRAT_CATEGORY", "linear");
+    std::string symbol   = env_or("STRAT_SYMBOL", "ETHUSDT");
+    double qty           = std::stod(env_or("STRAT_QTY", "0.01"));
+
+    if (sig->type == StrategySignal::Type::Enter) {
+        std::string side = (sig->side == Side::Buy) ? "Buy" : "Sell";
+
+        {
+            std::lock_guard<std::mutex> log_lk(g_log_mtx);
+            std::cout << "[AUTO] ENTER placing MARKET " << side
+                      << " " << symbol << " qty=" << qty << "\n";
+        }
+
+        std::string resp = bybit.place_market_order(category, symbol, side, qty);
+
+        {
+            std::lock_guard<std::mutex> log_lk(g_log_mtx);
+            std::cout << "[AUTO] resp=" << resp << "\n";
+        }
+    } else {
+        {
+            std::lock_guard<std::mutex> log_lk(g_log_mtx);
+            std::cout << "[AUTO] EXIT reduce-only close " << symbol << "\n";
+        }
+
+        std::string resp = bybit.close_position_market_reduce_only(category, symbol);
+
+        {
+            std::lock_guard<std::mutex> log_lk(g_log_mtx);
+            std::cout << "[AUTO] resp=" << resp << "\n";
+        }
+    }
+}
 
             } catch (const std::exception& e) {
                 std::cout << "[ERR] " << e.what() << "\n";
@@ -775,6 +863,8 @@ int main() {
               << "  realwL      <symbol> <minutes>\n"
               << "  lotsL       <category> <symbol>\n"
               << "  pnlFULL   <category> <symbol> <minutes>\n"
+			  << "  auto on|off"
+			  << "  sig on|off\n"
               << "  quit\n\n";
 
     std::string cmd;
@@ -797,7 +887,19 @@ int main() {
             std::cout << "bid=" << bid << " ask=" << ask << "\n";
             continue;
         }
-
+		if (cmd == "auto") {
+			std::string v; std::cin >> v;
+			g_auto.store(v == "on");
+			std::cout << "[AUTO] " << (g_auto.load() ? "ON" : "OFF") << "\n";
+			continue;
+		}
+		if (cmd == "sig") {
+    std::string v; std::cin >> v;
+    g_print_sig.store(v == "on");
+    std::lock_guard<std::mutex> lk(g_log_mtx);
+    std::cout << "[SIGPRINT] " << (g_print_sig.load() ? "ON" : "OFF") << "\n";
+    continue;
+}
         // ---- cancel ----
         if (cmd == "cancel") {
             std::string category, symbol, orderId;

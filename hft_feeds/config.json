@@ -1,6 +1,6 @@
 {
   "exchanges": ["Bybit"],
-  "instruments": ["ETHUSDC"],
+  "instruments": ["ETHUSDT"],
   "orderBookPollFrequencyInMs": 20,
   "orderBookDepth": 20
 }
