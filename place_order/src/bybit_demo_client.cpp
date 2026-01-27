@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <cstdlib>
 #include <cmath>
+#include <atomic>
 
 std::string BybitDemoClient::place_limit_order(
     const std::string& category,
@@ -16,7 +17,8 @@ std::string BybitDemoClient::place_limit_order(
     const std::string& side,
     double qty,
     double price,
-    const std::string& tif
+    const std::string& tif,
+	bool reduceOnly
 ) {
     nlohmann::json j;
     j["category"] = category;
@@ -26,7 +28,7 @@ std::string BybitDemoClient::place_limit_order(
     j["qty"] = std::to_string(qty);
     j["price"] = std::to_string(price);
     j["timeInForce"] = tif;          // "GTC" good default
-
+	if (reduceOnly) j["reduceOnly"] = true;
     return post("/v5/order/create", j.dump());
 }
 
@@ -57,6 +59,96 @@ static size_t write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
     s->append(ptr, size * nmemb);
     return size * nmemb;
 }
+// -------------------- PUBLIC GET (no signature) for /v5/market/time --------------------
+std::string BybitDemoClient::get_public(const std::string& path, const std::string& query_string) {
+    const std::string base = "https://api-demo.bybit.com";
+    const std::string url  = base + path + (query_string.empty() ? "" : ("?" + query_string));
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return "{\"error\":\"curl init failed\"}";
+
+    std::string resp;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+
+    CURLcode rc = curl_easy_perform(curl);
+
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+    curl_easy_cleanup(curl);
+
+    if (rc != CURLE_OK) {
+        return std::string("{\"error\":\"curl perform failed\",\"msg\":\"") + curl_easy_strerror(rc) + "\"}";
+    }
+    if (http_code < 200 || http_code >= 300) {
+        return std::string("{\"error\":\"http\",\"code\":") + std::to_string(http_code) +
+               ",\"resp\":\"" + resp + "\"}";
+    }
+    return resp;
+}
+
+// -------------------- TIME SYNC (FIX retCode=10002) --------------------
+bool BybitDemoClient::sync_time() {
+    // local time captured as close as possible to request
+    const long long local_before = now_ms();
+
+    std::string resp = get_public("/v5/market/time", "");
+
+    try {
+        auto j = nlohmann::json::parse(resp);
+        if (!j.contains("retCode") || j["retCode"].get<int>() != 0) return false;
+
+        long long server_ms = 0;
+
+        // Most common: top-level "time" (ms)
+        if (j.contains("time")) {
+            if (j["time"].is_number_integer()) server_ms = j["time"].get<long long>();
+            else if (j["time"].is_string())    server_ms = std::stoll(j["time"].get<std::string>());
+        }
+
+        // Fallback: some responses have result.timeSecond / result.timeNano
+        if (server_ms <= 0 && j.contains("result")) {
+            auto &r = j["result"];
+            if (r.contains("timeSecond")) {
+                if (r["timeSecond"].is_string()) server_ms = std::stoll(r["timeSecond"].get<std::string>()) * 1000LL;
+                else if (r["timeSecond"].is_number_integer()) server_ms = r["timeSecond"].get<long long>() * 1000LL;
+            }
+            if (server_ms <= 0 && r.contains("timeNano") && r["timeNano"].is_string()) {
+                const std::string tn = r["timeNano"].get<std::string>();
+                // nanoseconds since epoch -> ms (drop last 6 digits)
+                if (tn.size() > 6) server_ms = std::stoll(tn.substr(0, tn.size() - 6));
+            }
+        }
+
+        if (server_ms <= 0) return false;
+
+        // If you want slightly better accuracy:
+        // take midpoint between before/after. Keep simple for now.
+        const long long local_after = now_ms();
+        const long long local_mid = (local_before + local_after) / 2;
+
+        // offset = server - local
+        time_offset_ms_.store(server_ms - local_mid);
+        last_sync_local_ms_.store(local_after);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+long long BybitDemoClient::now_ms_adjusted() const {
+    // IMPORTANT:
+    // Bybit rejects if your timestamp is > ~1000ms ahead of server time.
+    // So we intentionally bias slightly BEHIND (safety margin).
+    const long long safety_back_ms = 250; // can bump to 500 if needed
+    return now_ms() + time_offset_ms_.load() - safety_back_ms;
+}
 
 BybitDemoClient::BybitDemoClient(std::string api_key, std::string api_secret)
 : api_key_(std::move(api_key)), api_secret_(std::move(api_secret)) {}
@@ -69,7 +161,8 @@ std::string BybitDemoClient::place_market_order(
     const std::string& category,
     const std::string& symbol,
     const std::string& side,
-    double qty
+    double qty,
+	bool reduceOnly
 ) {
     nlohmann::json j;
     j["category"] = category;      // "spot" / "linear"
@@ -77,7 +170,7 @@ std::string BybitDemoClient::place_market_order(
     j["side"] = side;              // "Buy" / "Sell"
     j["orderType"] = "Market";
     j["qty"] = std::to_string(qty);
-
+	if (reduceOnly) j["reduceOnly"] = true;
     return post("/v5/order/create", j.dump());
 }
 
@@ -87,7 +180,7 @@ std::string BybitDemoClient::post(const std::string& path, const std::string& bo
 
     const char* rw = std::getenv("BYBIT_RECV_WINDOW");
     const std::string recv_window = rw ? std::string(rw) : "5000";
-    const std::string ts = std::to_string(now_ms());
+    const std::string ts = std::to_string(now_ms_adjusted());
 
     // V5 signature: ts + apiKey + recvWindow + body
     const std::string payload = ts + api_key_ + recv_window + body_json;
@@ -255,7 +348,7 @@ std::string BybitDemoClient::get(const std::string& path, const std::string& que
 
     const char* rw = std::getenv("BYBIT_RECV_WINDOW");
     const std::string recv_window = rw ? std::string(rw) : "10000";
-    const std::string ts = std::to_string(now_ms());
+    const std::string ts = std::to_string(now_ms_adjusted());
 
     // V5 signature for GET: ts + apiKey + recvWindow + queryString
     const std::string payload = ts + api_key_ + recv_window + query_string;

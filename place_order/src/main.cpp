@@ -695,6 +695,10 @@ int main() {
         env_or("BYBIT_API_KEY", ""),
         env_or("BYBIT_API_SECRET", "")
     );
+	if (bybit.ready()) {
+    bool ok = bybit.sync_time();
+    std::cout << "[BYBIT] time sync " << (ok ? "OK" : "FAILED") << "\n";
+	}
 	ImbMomoParams sp;
 	ImbMomoStrategy strat(sp);
 	
@@ -865,6 +869,8 @@ int main() {
               << "  pnlFULL   <category> <symbol> <minutes>\n"
 			  << "  auto on|off"
 			  << "  sig on|off\n"
+			  << "  buy_ro    <category> <symbol> <qty>   (reduceOnly)\n"
+			  << "  sell_ro   <category> <symbol> <qty>   (reduceOnly)\n"
               << "  quit\n\n";
 
     std::string cmd;
@@ -1003,7 +1009,21 @@ int main() {
             }
             continue;
         }
+		if (cmd == "buy_ro" || cmd == "sell_ro") {
+    std::string category, symbol;
+    double qty = 0.0;
+    std::cin >> category >> symbol >> qty;
 
+    if (!bybit.ready()) {
+        std::cout << "Set BYBIT_API_KEY and BYBIT_API_SECRET first.\n";
+        continue;
+    }
+
+    std::string side = (cmd == "buy_ro") ? "Buy" : "Sell";
+    std::string resp = bybit.place_market_order(category, symbol, side, qty, true /*reduceOnly*/);
+    std::cout << resp << "\n";
+    continue;
+}
         // ---- pnlw (execution fees, paginated) ----
         if (cmd == "pnlw") {
             std::string category, symbol;
@@ -1867,7 +1887,7 @@ int main() {
         }
 
         if (cmd == "buy") {
-            std::string resp = bybit.place_limit_order(category, symbol, "Buy", qty, ask);
+            std::string resp = bybit.place_market_order(category, symbol, "Buy", qty, ask);
             std::cout << resp << "\n";
             try {
                 auto j = nlohmann::json::parse(resp);
@@ -1878,7 +1898,7 @@ int main() {
                 }
             } catch (...) {}
         } else if (cmd == "sell") {
-            std::string resp = bybit.place_limit_order(category, symbol, "Sell", qty, bid);
+            std::string resp = bybit.place_market_order(category, symbol, "Sell", qty, bid);
             std::cout << resp << "\n";
             try {
                 auto j = nlohmann::json::parse(resp);
