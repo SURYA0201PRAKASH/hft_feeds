@@ -46,6 +46,12 @@ static std::string dbl_to_str(double x) {
     std::snprintf(buf, sizeof(buf), "%.10f", x);
     return std::string(buf);
 }
+enum class OrdType { MKT, LMT };
+
+static OrdType parse_ordtype_or_default_mkt(const std::string& s) {
+    if (s == "lmt" || s == "LMT" || s == "limit" || s == "LIMIT") return OrdType::LMT;
+    return OrdType::MKT; // default
+}
 
 static std::string make_trade_id(const std::string& close_execId,
                                  const std::string& open_execId,
@@ -846,32 +852,32 @@ int main() {
     });
 
     // Main thread: user commands
-    std::cout << "\nCommands:\n"
-              << "  px\n"
-              << "  buy       <category> <symbol> <qty>\n"
-              << "  sell      <category> <symbol> <qty>\n"
-              << "  cancel    <category> <symbol> <orderId>\n"
-              << "  close     <category> <symbol>\n"
-              << "  pos       <category> <symbol>\n"
-              << "  pnl       <category> <symbol>\n"
-              << "  pnlw      <category> <symbol> <minutes>\n"
-              << "  fundw     <category> <symbol> <minutes>\n"
-              << "  pnlx      <category> <symbol> <minutes>\n"
-              << "  sync_exec <category> <symbol> <minutes>\n"
-              << "  sync_fund <category> <symbol> <minutes>\n"
-              << "  pnlwL   <symbol> <minutes>\n"
-              << "  fundwL  <symbol> <minutes>\n"
-              << "  pnlxL   <category> <symbol> <minutes>\n"
-              << "  reconcile <category> <symbol> <minutes>\n"
-              << "  sync_trades <category> <symbol>\n"
-              << "  realwL      <symbol> <minutes>\n"
-              << "  lotsL       <category> <symbol>\n"
-              << "  pnlFULL   <category> <symbol> <minutes>\n"
-			  << "  auto on|off"
-			  << "  sig on|off\n"
-			  << "  buy_ro    <category> <symbol> <qty>   (reduceOnly)\n"
-			  << "  sell_ro   <category> <symbol> <qty>   (reduceOnly)\n"
-              << "  quit\n\n";
+std::cout << "\nCommands:\n"
+          << "  px\n"
+          << "  buy         <category> <symbol> <qty>  mkt|lmt\n"
+          << "  sell        <category> <symbol> <qty>  mkt|lmt\n"
+          << "  cancel      <category> <symbol> <orderId>\n"
+          << "  close       <category> <symbol>\n"
+          << "  pos         <category> <symbol>\n"
+          << "  pnl         <category> <symbol>\n"
+          << "  pnlw        <category> <symbol> <minutes>\n"
+          << "  fundw       <category> <symbol> <minutes>\n"
+          << "  pnlx        <category> <symbol> <minutes>\n"
+          << "  sync_exec   <category> <symbol> <minutes>\n"
+          << "  sync_fund   <category> <symbol> <minutes>\n"
+          << "  pnlwL       <symbol> <minutes>\n"
+          << "  fundwL      <symbol> <minutes>\n"
+          << "  pnlxL       <category> <symbol> <minutes>\n"
+          << "  reconcile   <category> <symbol> <minutes>\n"
+          << "  sync_trades <category> <symbol>\n"
+          << "  realwL      <symbol> <minutes>\n"
+          << "  lotsL       <category> <symbol>\n"
+          << "  pnlFULL     <category> <symbol> <minutes>\n"
+          << "  auto on|off\n"
+          << "  sig on|off\n"
+          << "  close_short <category> <symbol> <qty>  mkt|lmt   (reduce SHORT)\n"
+          << "  close_long  <category> <symbol> <qty>  mkt|lmt   (reduce LONG)\n"
+          << "  quit\n\n";
 
     std::string cmd;
     while (std::cin >> cmd) {
@@ -1009,18 +1015,35 @@ int main() {
             }
             continue;
         }
-		if (cmd == "buy_ro" || cmd == "sell_ro") {
+		if (cmd == "close_short" || cmd == "close_long") {
     std::string category, symbol;
     double qty = 0.0;
+    std::string ord = "mkt";
     std::cin >> category >> symbol >> qty;
 
-    if (!bybit.ready()) {
-        std::cout << "Set BYBIT_API_KEY and BYBIT_API_SECRET first.\n";
-        continue;
+    // optional token
+    if (std::cin.peek() == ' ') {
+        while (std::cin.peek() == ' ') std::cin.get();
+        if (std::cin.peek() != '\n' && std::cin.peek() != '\r') std::cin >> ord;
+    }
+    OrdType ot = parse_ordtype_or_default_mkt(ord);
+
+    if (!bybit.ready()) { std::cout << "Set BYBIT_API_KEY and BYBIT_API_SECRET first.\n"; continue; }
+
+    double bid=0.0, ask=0.0;
+    { std::lock_guard<std::mutex> lk(g_px_mtx); bid=g_last_bid; ask=g_last_ask; }
+    if (bid <= 0.0 || ask <= 0.0) { std::cout << "No bid/ask yet. Run px.\n"; continue; }
+
+    std::string side = (cmd == "close_short") ? "Buy" : "Sell";
+
+    std::string resp;
+    if (ot == OrdType::MKT) {
+        resp = bybit.place_market_order(category, symbol, side, qty, true /*reduceOnly*/);
+    } else {
+        double px = (side == "Buy") ? ask : bid;
+        resp = bybit.place_limit_order(category, symbol, side, qty, px, "GTC", true /*reduceOnly*/);
     }
 
-    std::string side = (cmd == "buy_ro") ? "Buy" : "Sell";
-    std::string resp = bybit.place_market_order(category, symbol, side, qty, true /*reduceOnly*/);
     std::cout << resp << "\n";
     continue;
 }
@@ -1871,8 +1894,18 @@ int main() {
         // ---- buy/sell (default path) ----
         std::string category, symbol;
         double qty = 0.0;
+		std::string ord = "mkt"; // default
         std::cin >> category >> symbol >> qty;
-
+		// try read optional token without breaking next command
+		if (std::cin.peek() == ' ') {
+    		// eat spaces
+    		while (std::cin.peek() == ' ') std::cin.get();
+    		// if next is not newline, read token
+    		if (std::cin.peek() != '\n' && std::cin.peek() != '\r') {
+        		std::cin >> ord;
+    		}
+		}
+		OrdType ot = parse_ordtype_or_default_mkt(ord);
         if (!bybit.ready()) {
             std::cout << "Set BYBIT_API_KEY and BYBIT_API_SECRET first.\n";
             continue;
@@ -1887,7 +1920,13 @@ int main() {
         }
 
         if (cmd == "buy") {
-            std::string resp = bybit.place_market_order(category, symbol, "Buy", qty, ask);
+            std::string resp;
+            if (ot == OrdType::MKT) {
+                resp = bybit.place_market_order(category, symbol, "Buy", qty, false /*reduceOnly*/);
+            } else {
+                // lmt: use best ask
+                resp = bybit.place_limit_order(category, symbol, "Buy", qty, ask, "GTC", false /*reduceOnly*/);
+            }
             std::cout << resp << "\n";
             try {
                 auto j = nlohmann::json::parse(resp);
@@ -1898,7 +1937,13 @@ int main() {
                 }
             } catch (...) {}
         } else if (cmd == "sell") {
-            std::string resp = bybit.place_market_order(category, symbol, "Sell", qty, bid);
+            std::string resp;
+            if (ot == OrdType::MKT) {
+                resp = bybit.place_market_order(category, symbol, "Sell", qty, false /*reduceOnly*/);
+            } else {
+                // lmt: use best bid
+                resp = bybit.place_limit_order(category, symbol, "Sell", qty, bid, "GTC", false /*reduceOnly*/);
+            }
             std::cout << resp << "\n";
             try {
                 auto j = nlohmann::json::parse(resp);
